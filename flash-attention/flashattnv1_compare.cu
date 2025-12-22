@@ -27,12 +27,14 @@ __global__ void attn_naive_kernel(
     int d = threadIdx.x;
     if (q >= N || d >= D) return;
 
+    float scale = rsqrtf((float)D);
+
     float m = -1e20f;
     for (int j = 0; j < N; j++) {
         float s = 0.0f;
         for (int k = 0; k < D; k++)
             s += Q[q * D + k] * K[j * D + k];
-        m = fmaxf(m, s);
+        m = fmaxf(m, s * scale);
     }
 
     float l = 0.0f;
@@ -40,7 +42,7 @@ __global__ void attn_naive_kernel(
         float s = 0.0f;
         for (int k = 0; k < D; k++)
             s += Q[q * D + k] * K[j * D + k];
-        l += expf(s - m);
+        l += expf(s * scale - m);
     }
 
     float out = 0.0f;
@@ -48,7 +50,7 @@ __global__ void attn_naive_kernel(
         float s = 0.0f;
         for (int k = 0; k < D; k++)
             s += Q[q * D + k] * K[j * D + k];
-        float w = expf(s - m) / l;
+        float w = expf(s * scale - m) / l;
         out += w * V[j * D + d];
     }
 
@@ -74,17 +76,19 @@ __global__ void flashattn_v1_kernel(
     int q_row = blockIdx.x * Br + warp;
     if (warp >= Br || q_row >= N) return;
 
+    float scale = rsqrtf((float)D);
+
+
     extern __shared__ float smem[];
-    float* sQ = smem;          // Br*D
-    float* sK = sQ + Br * D;   // Bc*D
-    float* sV = sK + Bc * D;   // Bc*D
+    // TO DO: cache per-tile QK scores in shared 
+    float* sQ = smem; 
+    float* sK = sQ + Br * D; 
+    float* sV = sK + Bc * D;  
 
     float m = -1e20f;
-    float l = 0.0f; 
-
-    // init output accumulator
-    for (int d = lane; d < D; d += 32)
-        O[q_row * D + d] = 0.0f;
+    float l = 0.0f;
+    float o0 = 0.0f;
+    float o1 = 0.0f;
 
     // load Q tile
     for (int idx = threadIdx.x; idx < Br * D; idx += blockDim.x) {
@@ -99,16 +103,26 @@ __global__ void flashattn_v1_kernel(
         int cols = min(Bc, N - tile);
 
         // load K/V tile
-        for (int idx = threadIdx.x; idx < Bc * D; idx += blockDim.x) {
-            int tj = idx / D;
-            int d  = idx % D;
+	// vectorized global->shared loads (float4)
+	using Vec = float4;
+
+	Vec* sK4 =  reinterpret_cast<Vec*>(sK);
+        Vec* sV4 = reinterpret_cast<Vec*>(sV);
+	const Vec* gK4 = reinterpret_cast<const Vec*>(K);
+        const Vec* gV4 = reinterpret_cast<const Vec*>(V);
+
+
+	constexpr int D4 = D / 4;
+        for (int idx = threadIdx.x; idx < Bc * D4; idx += blockDim.x) {
+            int tj = idx / D4;
+            int d4  = idx % D4;
             int gj = tile + tj;
             if (tj < cols && gj < N) {
-                sK[idx] = K[gj * D + d];
-                sV[idx] = V[gj * D + d];
+		sK4[tj * D4 + d4] = gK4[gj * D4 + d4];
+                sV4[tj * D4 + d4] = gV4[gj * D4 + d4];
             } else {
-                sK[idx] = 0.0f;
-                sV[idx] = 0.0f;
+		sK4[tj * D4 + d4] = make_float4(0,0,0,0);
+                sV4[tj * D4 + d4] = make_float4(0,0,0,0);
             }
         }
         __syncthreads();
@@ -118,10 +132,11 @@ __global__ void flashattn_v1_kernel(
         for (int tj = 0; tj < cols; tj++) {
             float acc = 0.0f;
             for (int d = lane; d < D; d += 32)
-                acc += sQ[warp * D + d] * sK[tj * D + d]; 
+                acc += sQ[warp * D + d] * sK[tj * D + d];
 
-            float s = warpReduceSum(acc);
-            s = __shfl_sync(0xffffffff, s, 0); // broadcast within warp
+	    // warp dot: reduce + broadcast
+            float sum = warpReduceSum(acc);
+            float s = __shfl_sync(0xffffffff, sum, 0) * scale; //  lane0 sum -> broadcast
 
             if (lane == 0) lane0_max = fmaxf(lane0_max, s);
         }
@@ -134,8 +149,8 @@ __global__ void flashattn_v1_kernel(
         if (lane == 0) l *= alpha;
         l = __shfl_sync(0xffffffff, l, 0);
 
-        for (int d = lane; d < D; d += 32)
-            O[q_row * D + d] *= alpha;
+        o0 *= alpha;
+	o1 *= alpha;
 
         // pass 2: accumulate this
         float l_tile = 0.0f;
@@ -145,15 +160,18 @@ __global__ void flashattn_v1_kernel(
             for (int d = lane; d < D; d += 32)
                 acc += sQ[warp * D + d] * sK[tj * D + d];
 
-            float s = warpReduceSum(acc);
-            s = __shfl_sync(0xffffffff, s, 0);
+            float sum = warpReduceSum(acc);
+            float s = __shfl_sync(0xffffffff, sum, 0) * scale;
+	    
+	    float w;
+	    if (lane == 0) w = expf(s - m_new);
+	    w= __shfl_sync(0xffffffff, w, 0);
 
-            float w = expf(s - m_new);
 
             if (lane == 0) l_tile += w;
 
-            for (int d = lane; d < D; d += 32)
-                O[q_row * D + d] += w * sV[tj * D + d];
+            o0 += w* sV[tj * D + lane];
+	    o1 += w* sV[tj * D + (lane + 32)];
         }
 
         l_tile = __shfl_sync(0xffffffff, l_tile, 0);
@@ -167,8 +185,8 @@ __global__ void flashattn_v1_kernel(
     // normalize by sum exp
     float l0 = __shfl_sync(0xffffffff, l, 0);
     float inv_l = 1.0f / l0;
-    for (int d = lane; d < D; d += 32)
-        O[q_row * D + d] *= inv_l;
+    O[q_row * D + lane] = o0 * inv_l;
+    O[q_row * D + (lane + 32)] = o1 * inv_l;
 }
 
 int main() {
