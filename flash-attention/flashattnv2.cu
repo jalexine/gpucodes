@@ -1,4 +1,12 @@
 // flashattnv2.cu
+// Dan's (xinpw8) reimplementation of Flash Attention V2
+//   - Bc=64 tiling for better memory locality
+//   - float4 vectorized loads for coalesced global memory access
+//   - Score caching in shared memory to avoid redundant computation
+//   - Register accumulators for output to reduce shared memory pressure
+//   - Online softmax to compute attention in a single pass
+//   - Warp shuffle reductions for fast intra-warp communication
+
 #include <cstdio>
 #include <cuda_runtime.h>
 #include <cmath>
@@ -65,7 +73,7 @@ __global__ void flashattn_v2_kernel(const float* Q, const float* K, const float*
     float* sS = sV + Bc * D;
 
     float scale = rsqrtf((float)D);
-    float o0 = 0.0f, o1 = 0.0f;
+    float o0 = 0.0f, o1 = 0.0f;  // Register accumulators: keep output in registers, no shared memory writes until end
     float m = -1e20f, l = 0.0f;
 
     for (int idx = threadIdx.x; idx < Br * D; idx += blockDim.x) {
@@ -78,6 +86,7 @@ __global__ void flashattn_v2_kernel(const float* Q, const float* K, const float*
     for (int tile = 0; tile < N; tile += Bc) {
         int cols = min(Bc, N - tile);
 
+        // float4 loads: 4x fewer memory transactions, better bandwidth utilization
         for (int iv = threadIdx.x; iv < (Bc * D) / 4; iv += blockDim.x) {
             int idx = iv * 4;
             int tj = idx / D, c = idx % D, gj = tile + tj;
@@ -91,6 +100,7 @@ __global__ void flashattn_v2_kernel(const float* Q, const float* K, const float*
         }
         __syncthreads();
 
+        // Score caching: store QK^T scores in shared memory to avoid recomputation in softmax pass
         float lane0_max = -1e20f;
         for (int tj = 0; tj < cols; tj++) {
             float acc = sQ[warp * D + lane] * sK[tj * D + lane]
@@ -103,6 +113,7 @@ __global__ void flashattn_v2_kernel(const float* Q, const float* K, const float*
         }
         float tile_max = __shfl_sync(0xffffffff, lane0_max, 0);
 
+        // Online softmax: rescale running sum when max changes, avoids storing full score matrix
         float m_new = fmaxf(m, tile_max);
         float alpha = expf(m - m_new);
         if (lane == 0) l *= alpha;
