@@ -80,10 +80,10 @@ __global__ void flashattn_v1_kernel(
 
 
     extern __shared__ float smem[];
-    // TO DO: cache per-tile QK scores in shared 
     float* sQ = smem; 
     float* sK = sQ + Br * D; 
     float* sV = sK + Bc * D;  
+    float* sS = sV + Bc * D;
 
     float m = -1e20f;
     float l = 0.0f;
@@ -126,20 +126,24 @@ __global__ void flashattn_v1_kernel(
             }
         }
         __syncthreads();
+	
+	for (int tj = 0; tj < cols; tj++) {
+	    float acc = 0.0f;
+	    for (int d = lane; d < D; d += 32)
+		acc += sQ[warp * D + d] * sK[tj * D + d];
+	    float sum = warpReduceSum(acc);
+	    if (lane == 0)
+		sS[warp * Bc + tj] = sum * scale;
+	}
+	__syncthreads();
 
         //pass 1: max over this tile
         float lane0_max = -1e20f;
-        for (int tj = 0; tj < cols; tj++) {
-            float acc = 0.0f;
-            for (int d = lane; d < D; d += 32)
-                acc += sQ[warp * D + d] * sK[tj * D + d];
-
-	    // warp dot: reduce + broadcast
-            float sum = warpReduceSum(acc);
-            float s = __shfl_sync(0xffffffff, sum, 0) * scale; //  lane0 sum -> broadcast
-
-            if (lane == 0) lane0_max = fmaxf(lane0_max, s);
-        }
+	if (lane == 0) {
+	    for(int tj = 0; tj < cols; tj++) {
+	       lane0_max = fmaxf(lane0_max, sS[warp * Bc + tj]);
+	    }
+	}
         float tile_max = __shfl_sync(0xffffffff, lane0_max, 0);
 
         // online softmax update: rescale old state to new max
@@ -156,20 +160,12 @@ __global__ void flashattn_v1_kernel(
         float l_tile = 0.0f;
 
         for (int tj = 0; tj < cols; tj++) {
-            float acc = 0.0f;
-            for (int d = lane; d < D; d += 32)
-                acc += sQ[warp * D + d] * sK[tj * D + d];
-
-            float sum = warpReduceSum(acc);
-            float s = __shfl_sync(0xffffffff, sum, 0) * scale;
-	    
+            float s = sS[warp * Bc + tj];
 	    float w;
-	    if (lane == 0) w = expf(s - m_new);
-	    w= __shfl_sync(0xffffffff, w, 0);
-
-
-            if (lane == 0) l_tile += w;
-
+	    if (lane == 0) w = expf(s-m_new);
+	    w = __shfl_sync(0xffffffff, w, 0);
+	    
+	    if (lane == 0) l_tile += w;
             o0 += w* sV[tj * D + lane];
 	    o1 += w* sV[tj * D + (lane + 32)];
         }
@@ -221,7 +217,7 @@ int main() {
 
     dim3 grid_flash((N + Br - 1) / Br);
     dim3 block_flash(Br * 32);
-    size_t shmem = (size_t)(Br * D + 2 * Bc * D) * sizeof(float);
+    size_t shmem = (Br * D + 2 * Bc * D + Br * Bc) * sizeof(float); 
 
     cudaEvent_t start, stop;
     CUDA_CHECK(cudaEventCreate(&start));
